@@ -1,0 +1,406 @@
+//
+// Created by ek on 28.07.2022.
+//
+
+#include "ds_speed.h"
+//#include "metadata.h"
+//#include "trackerparsing.h"
+#include "dsanalytics.h"
+#include "message_handler.h"
+#include "post_processing.h"
+
+
+
+constexpr auto NUMBER_QUEUES = 12;
+constexpr auto ELEMENT_QUEUE = "queue";
+constexpr auto PAD_NAME_SRC = "src";
+constexpr auto PAD_NAME_SINK = "sink_0";
+
+
+
+
+int ds_speed_estimation (int argc, char *argv[])
+{
+    GMainLoop *loop = NULL;
+    GstElement *pipeline = NULL, *source = NULL, *h264parser = NULL, *vehicle_tracker=NULL, *nvdsanalytics=NULL,
+            *decoder = NULL, *streammux = NULL, *sink = NULL, *vehicle_detector = NULL, *nvvidconv = NULL,
+            *nvvidconv_postosd=NULL, *capsfilter=NULL, *encoder = NULL, *codeparser = NULL, *container = NULL,
+            *nvosd = NULL;
+    // for RTSP feed ...
+    GstElement  *tiler=NULL, *nvdslogger = NULL, *x264enc = NULL, *qtmux=NULL, *filter4=NULL, *rtppay = NULL,
+                *parse = NULL, *source_bin= NULL;
+
+    GstCaps *caps4 = NULL;
+    /* transform is required in jetson devices -->to be tested */
+//    GstElement *transform = NULL;
+//    GstCapsFeatures *feature = NULL;
+//    perf_measure perf_measure;
+
+    GstElement *fpsSink = nullptr;
+    GstBus *bus = NULL;
+    guint bus_watch_id;
+    GstPad *osd_sink_pad=NULL; //, *nvdsanalytics_src_pad = NULL;
+    GstPad *tiler_src_pad = NULL;
+    guint i =0, num_sources = 0;
+    guint tiler_rows, tiler_columns;
+
+    int current_device = -1;
+    cudaGetDevice(&current_device);
+    struct cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, current_device);
+
+//    GstRTSPMountPoints *mounts;
+//    GstRTSPMediaFactory *factory;
+//    char udpsrc_pipeline[512];
+
+
+    /* Check input arguments */
+//    if (argc != 3) {
+        g_printerr ("Usage: RTSP server and output to RTSP server -- \n", argv[0]);
+//        return -1;
+//    }
+    num_sources = argc - 2;
+    // debugging
+    putenv("GST_DEBUG=0");
+
+    /* Standard GStreamer initialization */
+    gst_init (&argc, &argv);
+    loop = g_main_loop_new (NULL, FALSE);
+
+    /* Create gstreamer elements */
+    /* Create Pipeline element that will form a connection of other elements */
+    pipeline = gst_pipeline_new ("track-pipeline");
+
+    /* Source element for reading from the file */
+//    source = gst_element_factory_make ("filesrc", "file-source");
+    /* in case of using RTSP as a source */
+    /* this is for single source */
+    source_bin = rtsphandler::create_source_bin (0, argv[1]);
+
+    if (!source_bin) {
+        g_printerr ("Failed to create source bin. Exiting.\n");
+        return -1;
+    }
+
+
+    /* Since the data format in the input file is elementary h264 stream,
+     * we need a h264parser */
+    h264parser = gst_element_factory_make ("h264parse", "h264-parser");
+
+    /* Use convertor to convert from NV12 to RGBA as required by nvosd */
+    nvvidconv = gst_element_factory_make ("nvvideoconvert", "nvvideo-converter");
+
+    /* converter */
+    nvvidconv_postosd = gst_element_factory_make("nvvideoconvert", "convertor2");
+
+    /* */
+    capsfilter = gst_element_factory_make("capsfilter", "capsfilter");
+
+    /*  */
+    encoder = gst_element_factory_make("avenc_mpeg4", "encoder");
+
+    /* */
+    codeparser = gst_element_factory_make("mpeg4videoparse", "mpeg4-parser");
+
+    /* */
+    container = gst_element_factory_make("mp4mux", "mux");
+
+    /* Use nvdec_h264 for hardware accelerated decode on GPU */
+    decoder = gst_element_factory_make ("nvv4l2decoder", "nvv4l2-decoder");
+
+    /* Create nvstreammux instance to form batches from one or more sources. */
+    streammux = gst_element_factory_make ("nvstreammux", "stream-muxer");
+
+    if (!pipeline || !streammux) {
+        g_printerr ("One element could not be created. Exiting.\n");
+        return -1;
+    }
+
+    /* Use nvinfer to run inferencing on decoder's output,
+     * behaviour of inferencing is set through config file */
+    vehicle_detector = gst_element_factory_make ("nvinfer", "vehicle_detection");
+
+    /* introducing tracker */
+    vehicle_tracker = gst_element_factory_make("nvtracker", "vehicle_tracking");
+
+    if (vehicle_tracker== nullptr){
+        g_print("tracker is not defined!\n ");
+        return -1;
+    }
+
+    /* Create OSD to draw on the converted RGBA buffer */
+    nvosd = gst_element_factory_make ("nvdsosd", "nv-onscreendisplay");
+    //todo: add controls
+
+
+    /* Use nvdslogger for perf measurement. */
+    nvdslogger = gst_element_factory_make ("nvdslogger", "nvdslogger");
+
+    /* Use nvtiler to composite the batched frames into a 2D tiled array based
+     * on the source of the frames. */
+    tiler = gst_element_factory_make ("nvmultistreamtiler", "nvtiler");
+
+    /* h264 encoder */
+    x264enc = gst_element_factory_make ("x264enc", "h264 encoder");
+
+    /* */
+    qtmux = gst_element_factory_make ("qtmux", "muxer");
+    filter4 = gst_element_factory_make ("capsfilter", "filter4");
+    caps4 = gst_caps_from_string ("video/x-raw, format=I420");
+    g_object_set (G_OBJECT (filter4), "caps", caps4, NULL);
+    gst_caps_unref (caps4);
+
+
+    if (!nvvidconv || !x264enc || !qtmux || !filter4) {
+        g_printerr ("One element could not be created. %p,%p,%p,%p, Exiting.\n",nvvidconv, x264enc, qtmux,
+                    filter4);
+        return -1;
+    }
+
+
+    //    sink = gst_element_factory_make ("fakesink", "nvvideo-renderer");
+    //    sink = gst_element_factory_make ("nveglglessink", "nvvideo-renderer");
+    /* sinking part */
+
+    guint udp_port  = 5400;
+    parse = gst_element_factory_make ("h264parse", "h264-parser2");
+    rtppay = gst_element_factory_make ("rtph264pay", "rtp-payer");
+    sink = gst_element_factory_make ("udpsink", "udp-sink");
+
+    if ( !sink || !rtppay || !parse)
+    {
+        g_printerr ("One element could not be created. Exiting.\n");
+        return -1;
+    }
+    // old sink to file
+//    sink = gst_element_factory_make ("filesink", "filesink");
+    /* */
+    fpsSink = gst_element_factory_make ("fpsdisplaysink", "fps-display");
+    if (nullptr == fpsSink) {
+        g_print("problem with fpsSink!\n ");
+        return -1;
+    }
+
+    /* analytics */
+    nvdsanalytics = gst_element_factory_make("nvdsanalytics", "nvdsanalytics");
+    if (nullptr==nvdsanalytics){
+        g_print(" nvdsanalytics is null \n");
+        return -1;
+    }
+
+
+    /* Finally render the osd output, no need to transform in laptop */
+    //    if(prop.integrated) {
+    //        transform = gst_element_factory_make ("nvegltransform", "nvegl-transform");
+    //    }
+
+    if ( !h264parser || !decoder || !vehicle_detector || !vehicle_tracker
+        || !nvvidconv || !nvosd || !sink) {
+        g_printerr ("One element could not be created. Exiting.\n");
+        return -1;
+    }
+
+    //    if(!transform && prop.integrated) {
+    //        g_printerr ("One tegra element could not be created. Exiting.\n");
+    //        return -1;
+    //    }
+
+    /* we set the input filename to the source element */
+//    g_object_set (G_OBJECT (source), "location", argv[1], NULL);
+
+    g_object_set (G_OBJECT (streammux), "batch-size", num_sources, NULL);
+
+    g_object_set (G_OBJECT (streammux), "width", MUXER_OUTPUT_WIDTH, "height",
+                  MUXER_OUTPUT_HEIGHT, "batched-push-timeout", MUXER_BATCH_TIMEOUT_USEC, NULL);
+
+
+//    caps = gst_caps_new_simple ("video/x-raw", "format", G_TYPE_STRING, "I420", NULL);
+//    g_object_set (G_OBJECT (capsfilter), "caps", caps, NULL);
+
+    g_object_set (G_OBJECT (encoder), "bitrate", 2000000, NULL);
+
+    // detector setting
+    g_object_set (G_OBJECT (vehicle_detector),
+                  "config-file-path", "../cfg/config_infer_primary_yolov7.txt", NULL);
+    g_object_set(G_OBJECT(vehicle_detector), "unique-id", PRIMARY_DETECTOR_UID, NULL);
+
+    // tracker settings
+    //
+    g_object_set (G_OBJECT (vehicle_tracker), CONFIG_GROUP_TRACKER_WIDTH, tracker_width, nullptr);
+    g_object_set (G_OBJECT (vehicle_tracker), CONFIG_GROUP_TRACKER_HEIGHT, tracker_height, nullptr);
+    g_object_set (G_OBJECT (vehicle_tracker), CONFIG_GROUP_TRACKER_LL_CONFIG_FILE, ll_config_file.c_str(), nullptr);
+    g_object_set (G_OBJECT (vehicle_tracker), CONFIG_GROUP_TRACKER_LL_LIB_FILE, ll_lib_file.c_str(), nullptr);
+    g_object_set (G_OBJECT (vehicle_tracker), CONFIG_GROUP_TRACKER_ENABLE_BATCH_PROCESS,
+                  enable_batch_process, nullptr);
+
+    /* source options first two for rtsp case */
+//    g_object_set(G_OBJECT (source), "latency", 2000, NULL);
+//    g_object_set(GST_OBJECT(source), "location", RTSPCAM, NULL);
+
+    /* sinking */
+//    g_object_set (G_OBJECT (sink), "location", argv[2], NULL);
+//    g_object_set (G_OBJECT (sink), "sync", 1, NULL);
+//    g_object_set (G_OBJECT (sink), "async", 0, NULL);
+//
+
+    g_object_set (G_OBJECT (fpsSink), "text-overlay", FALSE, "video-sink", sink, "sync", FALSE, NULL);
+
+    g_object_set (G_OBJECT (nvdsanalytics), "config-file", "../cfg/config_nvdsanalytics.txt", nullptr);
+
+    /* visualization part */
+    tiler_rows = (guint) sqrt (num_sources);
+    tiler_columns = (guint) ceil (1.0 * num_sources / tiler_rows);
+
+    g_object_set (G_OBJECT (tiler), "rows", tiler_rows, "columns", tiler_columns,
+                  "width", TILED_OUTPUT_WIDTH, "height", TILED_OUTPUT_HEIGHT, NULL);
+
+    g_object_set (G_OBJECT (nvosd), "process-mode", OSD_PROCESS_MODE,
+                  "display-text", OSD_DISPLAY_TEXT, NULL);
+
+    g_object_set (G_OBJECT (x264enc), "preset-level", 1, NULL);
+    g_object_set (G_OBJECT (x264enc), "insert-sps-pps", 1, NULL);
+    g_object_set (G_OBJECT (x264enc), "buf-api-version", 1, NULL);
+
+    g_object_set (G_OBJECT (sink), "host", "127.0.0.1", "port", udp_port, "async",
+                  FALSE, "sync", 1, NULL);
+
+
+    /* we add a message handler */
+    bus = gst_pipeline_get_bus (GST_PIPELINE (pipeline));
+    bus_watch_id = gst_bus_add_watch (bus, rtsphandler::bus_call, loop);
+    gst_object_unref (bus);
+
+    /* Set up the pipeline */
+    std::array<GstElement*, NUMBER_QUEUES> queues{
+            {gst_element_factory_make (ELEMENT_QUEUE, "queue1"),
+                    gst_element_factory_make (ELEMENT_QUEUE, "queue2"),
+                    gst_element_factory_make (ELEMENT_QUEUE, "queue3"),
+                    gst_element_factory_make (ELEMENT_QUEUE, "queue4"),
+                    gst_element_factory_make (ELEMENT_QUEUE, "queue5"),
+                    gst_element_factory_make (ELEMENT_QUEUE, "queue6"),
+                    gst_element_factory_make (ELEMENT_QUEUE, "queue7"),
+                    gst_element_factory_make (ELEMENT_QUEUE, "queue8"),
+                    gst_element_factory_make (ELEMENT_QUEUE, "queue9"),
+                    gst_element_factory_make (ELEMENT_QUEUE, "queue10"),
+                    gst_element_factory_make (ELEMENT_QUEUE, "queue11"),
+                    gst_element_factory_make (ELEMENT_QUEUE, "queue12"),
+            }};
+
+    /* we add all elements into the pipeline */
+
+    gst_bin_add_many (GST_BIN (pipeline),
+                      source_bin, h264parser, decoder, streammux,  vehicle_detector,
+                      nvdslogger, tiler,
+                      vehicle_tracker,
+                      nvdsanalytics, nvvidconv, nvosd, nvvidconv_postosd,
+                      /*sink as rtsp stream*/
+                      filter4, x264enc, parse, rtppay,
+                      queues[0], queues[1], queues[2], queues[3], queues[4], queues[5], queues[6], queues[7], queues[8],
+                      queues[9], queues[10],
+                      fpsSink, NULL);
+                      /* sink to file*/
+//                       capsfilter, encoder, codeparser, container, fpsSink, NULL);
+
+    GstPad *sinkpad, *srcpad;
+    sinkpad = gst_element_get_request_pad (streammux, PAD_NAME_SINK);
+    if (!sinkpad) {
+        g_printerr ("Streammux request sink pad failed. Exiting.\n");
+        return -1;
+    }
+
+//    srcpad = gst_element_get_static_pad (decoder, PAD_NAME_SRC);
+    srcpad = gst_element_get_static_pad (source_bin, PAD_NAME_SRC);
+    if (!srcpad) {
+        g_printerr ("Decoder request src pad failed. Exiting.\n");
+        return -1;
+    }
+
+    if (gst_pad_link (srcpad, sinkpad) != GST_PAD_LINK_OK) {
+        g_printerr ("Failed to link decoder to stream muxer. Exiting.\n");
+        return -1;
+    }
+
+    gst_object_unref (sinkpad);
+    gst_object_unref (srcpad);
+
+    /* we link the elements together */
+    /* file-source -> h264-parser -> nvh264-decoder ->
+     * nvinfer -> nvvidconv -> nvosd -> video-renderer */
+
+//    if (!gst_element_link_many ( source, h264parser, decoder, NULL)) {
+//        g_printerr ("Elements could not be linked: 1. Exiting.\n");
+//        return -1;
+//    }
+
+    // this is for pc
+    if (!gst_element_link_many (streammux, queues[0], vehicle_detector, queues[2],
+                                vehicle_tracker, queues[3], nvdsanalytics, queues[4], nvvidconv, queues[5], nvosd, NULL)) {
+        g_printerr ("Elements could not be linked: 2. Exiting.\n");
+        return -1;
+    }
+
+    if(!gst_element_link_many(nvosd,  queues[6], nvvidconv_postosd, queues[7],
+                              filter4, queues[8], x264enc, queues[9], parse, queues[10], rtppay, fpsSink, NULL)) {
+                              /* sink to file */
+//                              capsfilter, encoder, codeparser, container, fpsSink, NULL) ){
+        g_printerr ("Elements could not be linked: 3. Exiting.\n");
+        return -1;
+    }
+
+    /* Lets add probe to get informed of the meta data generated, we add probe to
+     * the sink pad of the osd element, since by that time, the buffer would have
+     * had got all the metadata.a pad after detector */
+
+    tiler_src_pad = gst_element_get_static_pad (nvosd, "sink");
+    if (!tiler_src_pad)
+        g_print ("Unable to get src pad\n");
+    else
+        gst_pad_add_probe (tiler_src_pad, GST_PAD_PROBE_TYPE_BUFFER,
+                           process::tiler_src_pad_buffer_probe, NULL, NULL);
+    gst_object_unref (tiler_src_pad);
+
+
+    /* analytics pad (the last one )*/
+
+    osd_sink_pad = gst_element_get_static_pad (nvdsanalytics, PAD_NAME_SRC);
+    if (!osd_sink_pad)
+        g_print ("Unable to get sink pad\n");
+    else
+        gst_pad_add_probe ( osd_sink_pad,
+                            GST_PAD_PROBE_TYPE_BUFFER,
+//                            osd_sink_pad_buffer_probe,
+                            dsanalytic::nvdsanalyticsSrcPadBufferProbe,
+                            reinterpret_cast<gpointer>(fpsSink),
+                            NULL );
+
+    gst_object_unref (osd_sink_pad);
+
+    /* streamming */
+    rtsphandler::start_rtsp_streaming ( 8557, udp_port, 0); // orig port: 8554 (used for src)
+
+    /* save the pipeline */
+    //putenv("GST_DEBUG_DUMP_DOT_DIR=../results");
+    //GST_DEBUG_BIN_TO_DOT_FILE_WITH_TS(GST_BIN(pipeline), GST_DEBUG_GRAPH_SHOW_ALL, "demo-app-pipeline");
+
+    /* Set the pipeline to "playing" state */
+    g_print ("Now playing");
+    gst_element_set_state (pipeline, GST_STATE_PLAYING);
+
+
+    /* Wait till pipeline encounters an error or EOS */
+    g_print ("Running...\n");
+    g_main_loop_run (loop);
+
+    /* Out of the main loop, clean up nicely */
+    g_print ("Returned, stopping playback\n");
+    // destroy sourcebin
+    rtsphandler::destroy_sink_bin();
+
+    gst_element_set_state (pipeline, GST_STATE_NULL);
+    g_print ("Deleting pipeline\n");
+    gst_object_unref (GST_OBJECT (pipeline));
+    g_source_remove (bus_watch_id);
+    g_main_loop_unref (loop);
+    return 0;
+}
+

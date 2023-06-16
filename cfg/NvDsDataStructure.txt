@@ -1,0 +1,235 @@
+typedef struct _NvDsBatchMeta {
+  NvDsBaseMeta base_meta;
+  /** Holds the maximum number of frames in the batch. */
+  guint max_frames_in_batch;
+  /** Holds the number of frames now in the batch. */
+  guint num_frames_in_batch;
+  /** Holds a pointer to a pool of pointers of type @ref NvDsFrameMeta,
+   representing a pool of frame metas. */
+  NvDsMetaPool *frame_meta_pool;
+  /** Holds a pointer to a pool of pointers of type NvDsObjMeta,
+   representing a pool of object metas. */
+  NvDsMetaPool *obj_meta_pool;
+  /** Holds a pointer to a pool of pointers of type @ref NvDsClassifierMeta,
+   representing a pool of classifier metas. */
+  NvDsMetaPool *classifier_meta_pool;
+  /** Holds a pointer to a pool of pointers of type @ref NvDsDisplayMeta,
+   representing a pool of display metas. */
+  NvDsMetaPool *display_meta_pool;
+  /** Holds a pointer to a pool of pointers of type @ref NvDsUserMeta,
+   representing a pool of user metas. */
+  NvDsMetaPool *user_meta_pool;
+  /** Holds a pointer to a pool of pointers of type @ref NvDsLabelInfo,
+   representing a pool of label metas. */
+  NvDsMetaPool *label_info_meta_pool;
+  /** Holds a pointer to a list of pointers of type NvDsFrameMeta
+   or NvDsAudioFrameMeta (when the batch represent audio batch),
+   representing frame metas used in the current batch.
+   */
+  NvDsFrameMetaList *frame_meta_list;
+  /** Holds a pointer to a list of pointers of type NvDsUserMeta,
+   representing user metas in the current batch. */
+  NvDsUserMetaList *batch_user_meta_list;
+  /** Holds a lock to be set before accessing metadata to avoid
+   simultaneous update by multiple components. */
+  GRecMutex meta_mutex;
+  /** Holds an array of user-specific batch information. */
+  gint64 misc_batch_info[MAX_USER_FIELDS];
+  /** For internal use. */
+  gint64 reserved[MAX_RESERVED_FIELDS];
+} NvDsBatchMeta;
+
+/**
+ * Holds metadata for a frame in a batch.
+ */
+typedef struct _NvDsFrameMeta {
+  /** Holds the base metadata for the frame. */
+  NvDsBaseMeta base_meta;
+  /** Holds the pad or port index of the Gst-streammux plugin for the frame
+   in the batch. */
+  guint pad_index;
+  /** Holds the location of the frame in the batch. The frame's
+   @ref NvBufSurfaceParams are at index @a batch_id in the @a surfaceList
+   array of @ref NvBufSurface. */
+  guint batch_id;
+  /** Holds the current frame number of the source. */
+  gint frame_num;
+  /** Holds the presentation timestamp (PTS) of the frame. */
+  guint64 buf_pts;
+  /** Holds the ntp timestamp. */
+  guint64 ntp_timestamp;
+  /** Holds the source IDof the frame in the batch, e.g. the camera ID.
+   It need not be in sequential order. */
+  guint source_id;
+  /** Holds the number of surfaces in the frame, required in case of
+   multiple surfaces in the frame. */
+  gint num_surfaces_per_frame;
+  /* Holds the width of the frame at input to Gst-streammux. */
+  guint source_frame_width;
+  /* Holds the height of the frame at input to Gst-streammux. */
+  guint source_frame_height;
+  /* Holds the surface type of the subframe, required in case of
+   multiple surfaces in the frame. */
+  guint surface_type;
+  /* Holds the surface index of tje subframe, required in case of
+   multiple surfaces in the frame. */
+  guint surface_index;
+  /** Holds the number of object meta elements attached to current frame. */
+  guint num_obj_meta;
+  /** Holds a Boolean indicating whether inference is performed on the frame. */
+  gboolean bInferDone;
+  /** Holds a pointer to a list of pointers of type @ref NvDsObjectMeta
+   in use for the frame. */
+  NvDsObjectMetaList *obj_meta_list;
+  /** Holds a pointer to a list of pointers of type @ref NvDsDisplayMeta
+   in use for the frame. */
+  NvDisplayMetaList *display_meta_list;
+  /** Holds a pointer to a list of pointers of type @ref NvDsUserMeta
+   in use for the frame. */
+  NvDsUserMetaList *frame_user_meta_list;
+  /** Holds additional user-defined frame information. */
+  gint64 misc_frame_info[MAX_USER_FIELDS];
+  /* Holds the width of the frame at output of Gst-streammux. */
+  guint pipeline_width;
+  /* Holds the height of the frame at output of Gst-streammux. */
+  guint pipeline_height;
+  /** For internal use. */
+  gint64 reserved[MAX_RESERVED_FIELDS];
+} NvDsFrameMeta;
+
+
+typedef struct _NvDsObjectMeta {
+  NvDsBaseMeta base_meta;
+  /** Holds a pointer to the parent @ref NvDsObjectMeta. Set to NULL if
+   no parent exists. */
+  struct _NvDsObjectMeta *parent;
+  /** Holds a unique component ID that identifies the metadata
+   in this structure. */
+  gint unique_component_id;
+  /** Holds the index of the object class inferred by the primary
+   detector/classifier. */
+  gint class_id;
+  /** Holds a unique ID for tracking the object. @ref UNTRACKED_OBJECT_ID
+   indicates that the object has not been tracked. */
+  guint64 object_id;
+  /** Holds a structure containing bounding box parameters of the object when
+    detected by detector. */
+  NvDsComp_BboxInfo detector_bbox_info;
+  /** Holds a structure containing bounding box coordinates of the object when
+   * processed by tracker. */
+  NvDsComp_BboxInfo tracker_bbox_info;
+  /** Holds a confidence value for the object, set by the inference
+   component. confidence will be set to -0.1, if "Group Rectangles" mode of
+   clustering is chosen since the algorithm does not preserve confidence
+   values. Also, for objects found by tracker and not inference component,
+   confidence will be set to -0.1 */
+  gfloat confidence;
+  /** Holds a confidence value for the object set by nvdcf_tracker.
+   * tracker_confidence will be set to -0.1 for KLT and IOU tracker */
+  gfloat tracker_confidence;
+  /** Holds a structure containing positional parameters of the object
+   * processed by the last component that updates it in the pipeline.
+   * e.g. If the tracker component is after the detector component in the
+   * pipeline then positinal parameters are from tracker component.
+   * Positional parameters are clipped so that they do not fall outside frame
+   * boundary. Can also be used to overlay borders or semi-transparent boxes on
+   * objects. @see NvOSD_RectParams. */
+  NvOSD_RectParams rect_params;
+  /** Holds mask parameters for the object. This mask is overlayed on object
+   * @see NvOSD_MaskParams. */
+  NvOSD_MaskParams mask_params;
+  /** Holds text describing the object. This text can be overlayed on the
+   standard text that identifies the object. @see NvOSD_TextParams. */
+  NvOSD_TextParams text_params;
+  /** Holds a string describing the class of the detected object. */
+  gchar obj_label[MAX_LABEL_SIZE];
+  /** Holds a pointer to a list of pointers of type @ref NvDsClassifierMeta. */
+  NvDsClassifierMetaList *classifier_meta_list;
+  /** Holds a pointer to a list of pointers of type @ref NvDsUserMeta. */
+  NvDsUserMetaList *obj_user_meta_list;
+  /** Holds additional user-defined object information. */
+  gint64 misc_obj_info[MAX_USER_FIELDS];
+  /** For internal use. */
+  gint64 reserved[MAX_RESERVED_FIELDS];
+}NvDsObjectMeta;
+
+/**
+ * Holds classifier metadata for an object.
+ */
+typedef struct _NvDsClassifierMeta {
+  NvDsBaseMeta base_meta;
+  /** Holds the number of outputs/labels produced by the classifier. */
+  guint num_labels;
+  /** Holds a unique component ID for the classifier metadata. */
+  gint unique_component_id;
+  /** Holds a pointer to a list of pointers of type @ref NvDsLabelInfo. */
+  NvDsLabelInfoList *label_info_list;
+  /** Holds the type of the classifier. */
+  const gchar *classifier_type;
+} NvDsClassifierMeta;
+
+/**
+ * Holds label metadata for the classifier.
+ */
+typedef struct _NvDsLabelInfo {
+  NvDsBaseMeta base_meta;
+  /** Holds the number of classes of the given label. */
+  guint num_classes;
+  /** Holds an string describing the label of the classified object. */
+  gchar result_label[MAX_LABEL_SIZE];
+  /** Holds a pointer to the result label if its length exceeds MAX_LABEL_SIZE bytes. */
+  gchar *pResult_label;
+  /** Holds the class UD of the best result. */
+  guint result_class_id;
+  /** Holds the label ID in case there are multiple label classifiers. */
+  guint label_id;
+  /** Holds the probability of best result. */
+  gfloat result_prob;
+} NvDsLabelInfo;
+
+/**
+ * Holds display metadata that the user can specify in the frame.
+ */
+typedef struct NvDsDisplayMeta {
+  NvDsBaseMeta base_meta;
+  /** Holds the number of rectangles described. */
+  guint num_rects;
+  /** Holds the number of labels (strings) described. */
+  guint num_labels;
+  /** Holds the number of lines described. */
+  guint num_lines;
+  /** Holds the number of arrows described. */
+  guint num_arrows;
+  /** Holds the number of circles described. */
+  guint num_circles;
+  /** Holds an array of positional parameters for rectangles.
+   Used to overlay borders or semi-transparent rectangles,
+   as required by the application. @see NvOSD_RectParams. */
+  NvOSD_RectParams rect_params[MAX_ELEMENTS_IN_DISPLAY_META];
+  /** Holds an array of text parameters for user-defined strings that can be
+   overlayed using this structure. @see NvOSD_TextParams. */
+  NvOSD_TextParams text_params[MAX_ELEMENTS_IN_DISPLAY_META];
+  /** Holds an array of line parameters that the user can use to draw polygons
+   in the frame, e.g. to show a RoI in the frame. @see NvOSD_LineParams. */
+  NvOSD_LineParams line_params[MAX_ELEMENTS_IN_DISPLAY_META];
+  /** Holds an array of arrow parameters that the user can use to draw arrows
+   in the frame. @see NvOSD_ArrowParams */
+  NvOSD_ArrowParams arrow_params[MAX_ELEMENTS_IN_DISPLAY_META];
+  /** Holds an array of circle parameters that the user can use to draw circles
+   in the frame. @see NvOSD_CircleParams */
+  NvOSD_CircleParams circle_params[MAX_ELEMENTS_IN_DISPLAY_META];
+  /** Holds an array of user-defined OSD metadata. */
+  gint64 misc_osd_data[MAX_USER_FIELDS];
+  /** For internal use. */
+  gint64 reserved[MAX_RESERVED_FIELDS];
+} NvDsDisplayMeta;
+
+/**
+ * Holds user metadata.
+ */
+typedef struct _NvDsUserMeta {
+  NvDsBaseMeta base_meta;
+  /** Holds a pointer to user data to be attached.
+   See the deepstream-user-metadata-test example for usage. */
+  void *user_meta_data;
+} NvDsUserMeta;
